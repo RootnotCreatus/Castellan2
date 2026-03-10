@@ -999,7 +999,7 @@ def create_dice_pve_session(uid:int, stake:int, session_message_id:Optional[int]
     )
     return get_dice_pve_session(session_id)
 
-def legacy_update_dice_pve_session_message(session_id:int, message_id:int):
+def update_dice_pve_session_message(session_id:int, message_id:int):
     execute("UPDATE dice_pve_sessions SET session_message_id=?, updated_at=? WHERE id=?", (message_id, now_ts(), session_id))
 
 def styled_inline_button(text:str, callback_data:str, style:Optional[str]=None):
@@ -1035,7 +1035,7 @@ def dice_pve_series_payout(stake:int, wins:int)->int:
     return max(stake, int(ceil(stake * dice_pve_series_multiplier(wins))))
 
 def dice_pve_series_fee(stake:int, payout:int)->int:
-    return max(0, payout - stake)
+    return max(0, int(round(payout * 0.06)))
 
 def dice_pve_action_keyboard(session_id:int):
     kb = types.InlineKeyboardMarkup()
@@ -1246,14 +1246,14 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
                         dice_pve_win_text(session),
                         reply_markup=dice_pve_action_keyboard(int(session["id"]))
                     )
-                    legacy_update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
+                    update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
             else:
                 sent = bot.send_message(
                     chat_id,
                     dice_pve_win_text(session),
                     reply_markup=dice_pve_action_keyboard(int(session["id"]))
                 )
-                legacy_update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
+                update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
 
             return session
 
@@ -1292,7 +1292,7 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
         raise
 
 def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
-    session = legacy_get_dice_pve_session(session_id)
+    session = get_dice_pve_session(session_id)
     if session is None:
         raise RuntimeError("Сессия не найдена.")
     if session["state"] != "active":
@@ -1311,7 +1311,7 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
                     reply_markup=None
                 )
             except Exception:
-                bot.send_message(chat_id, text, reply_markup=dice_pve_loss_reply_markup(final_session))
+                bot.send_message(chat_id, text)
         else:
             bot.send_message(chat_id, text)
 
@@ -1331,6 +1331,7 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
         wins = int(session["player_stands"] or 0) + 1
         payout = dice_pve_series_payout(int(session["stake_lux"]), wins)
         fee = dice_pve_series_fee(int(session["stake_lux"]), payout)
+
         active_session = dice_pve_update_round(
             session_id,
             player_roll,
@@ -1362,12 +1363,13 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
                 text,
                 reply_markup=dice_pve_action_keyboard(session_id)
             )
-            legacy_update_dice_pve_session_message(session_id, int(sent.message_id))
+            update_dice_pve_session_message(session_id, int(sent.message_id))
 
         return active_session
 
     final_session = finish_dice_pve_loss(session_id, player_roll, bot_roll)
     text = dice_pve_loss_text(final_session)
+    retry_kb = dice_pve_loss_reply_markup(final_session)
 
     if final_session["session_message_id"]:
         try:
@@ -1375,12 +1377,12 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
                 text,
                 chat_id,
                 int(final_session["session_message_id"]),
-                reply_markup=dice_pve_loss_reply_markup(final_session)
+                reply_markup=retry_kb
             )
         except Exception:
-            bot.send_message(chat_id, text)
+            bot.send_message(chat_id, text, reply_markup=retry_kb)
     else:
-        bot.send_message(chat_id, text, reply_markup=dice_pve_loss_reply_markup(final_session))
+        bot.send_message(chat_id, text, reply_markup=retry_kb)
 
     return final_session
 
