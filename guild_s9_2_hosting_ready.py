@@ -1657,7 +1657,7 @@ def legacy_create_dice_pve_session(uid:int, stake:int, player_roll_1:int, bot_ro
     )
     return legacy_get_dice_pve_session(session_id)
 
-def update_dice_pve_session_message(session_id:int, message_id:int):
+def legacy_update_dice_pve_session_message(session_id:int, message_id:int):
     execute("UPDATE dice_pve_sessions SET session_message_id=?, updated_at=? WHERE id=?", (message_id, now_ts(), session_id))
 
 def legacy_dice_pve_keyboard(session_id:int):
@@ -3533,8 +3533,8 @@ def cb_dice_pve_open(c):
         logging.exception("[DICE_PVE] failed to open series from lobby")
         bot.answer_callback_query(c.id, "Не удалось начать партию.", show_alert=True)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("dicepve:"))
-def cb_dice_pve(c):
+@bot.callback_query_handler(func=lambda c: False)
+def legacy_cb_dice_pve(c):
     if needs_verification(c.from_user.id):
         bot.answer_callback_query(c.id, "Сначала пройдите верификацию.")
         return
