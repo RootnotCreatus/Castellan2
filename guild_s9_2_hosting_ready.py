@@ -66,7 +66,7 @@ def get_message_text(m) -> str:
 
 def moscow_now() -> datetime:
     return datetime.now(MSK)
-DB_PATH="guild_bot_stage9.db"
+DB_PATH=os.getenv("DB_PATH", "guild_bot_stage9.db")
 XP_TO_LUX_RATE=10
 SHOP_PAGE_SIZE=10
 TASK_PAGE_SIZE=10
@@ -86,10 +86,10 @@ DICE_MAX_STAKE=100
 DICE_COOLDOWN_SECONDS=180
 DICE_WAIT_SECONDS=300
 DICE_FEE_PERCENT=4
-DICE_PVE_TARGET=12
 DICE_PVE_DAILY_LIMIT=10
-DICE_PVE_WIN_MULTIPLIER=185  # percent of stake returned on win
-DICE_PVE_TIE_REFUND_PERCENT=60
+DICE_PVE_DEFAULT_STAKE=DICE_MIN_STAKE
+DICE_PVE_SERIES_BASE=1.5
+DICE_PVE_SERIES_STEP=0.5
 SCHEMA_VERSION=3
 CONV_TTL_SECONDS=1800
 
@@ -635,6 +635,704 @@ def update_master_seals(uid:int, delta_tenths:int, reason:str, actor_user_id:Opt
     execute("UPDATE master_wallets SET seals_tenths=?, updated_at=? WHERE user_id=?", (new_value, now_ts(), uid))
     log_economy(actor_user_id, uid, "seal", int(delta_tenths), reason, meta)
     return get_master_wallet(uid)
+
+def user_label_by_id(uid:int)->str:
+    p=get_player(uid)
+    if p and p['username']:
+        return '@'+p['username']
+    return f"<code>{uid}</code>"
+
+def announce_master_action(text:str):
+    try:
+        bot.send_message(GUILD_CHAT_ID, text, message_thread_id=LEADERS_THREAD_ID)
+    except Exception:
+        logging.exception("[MASTER] failed to announce action")
+
+def create_master_task_submission(creator_id:int, title:str, description:str, reward_lux:int):
+    return execute("INSERT INTO master_task_submissions (creator_id, title, description, reward_lux, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)", (creator_id, title, description, reward_lux, now_ts()))
+
+def get_master_task_submission(sub_id:int):
+    return fetchone("SELECT * FROM master_task_submissions WHERE id=?", (sub_id,))
+
+def create_master_event_submission(creator_id:int, title:str, description:str, reward_lux:int):
+    return execute("INSERT INTO master_event_submissions (creator_id, title, description, reward_lux, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)", (creator_id, title, description, reward_lux, now_ts()))
+
+def get_master_event_submission(sub_id:int):
+    return fetchone("SELECT * FROM master_event_submissions WHERE id=?", (sub_id,))
+
+def create_master_item_submission(creator_id:int, name:str, description:str, price_lux:int, rarity:str, download_url:str):
+    return execute("INSERT INTO master_item_submissions (creator_id, name, description, price_lux, rarity, download_url, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)", (creator_id, name, description, price_lux, rarity, download_url, now_ts()))
+
+def get_master_item_submission(sub_id:int):
+    return fetchone("SELECT * FROM master_item_submissions WHERE id=?", (sub_id,))
+
+def create_master_event(creator_id:int, title:str, description:str, reward_lux:int):
+    approved_at=now_ts()
+    event_id=execute("INSERT INTO master_events (creator_id, title, description, reward_lux, status, created_at, approved_at) VALUES (?, ?, ?, ?, 'active', ?, ?)", (creator_id, title, description, reward_lux, approved_at, approved_at))
+    return get_master_event(event_id)
+
+def get_master_event(event_id:int):
+    return fetchone("SELECT * FROM master_events WHERE id=?", (event_id,))
+
+def get_master_event_by_message(message_id:int):
+    return fetchone("SELECT * FROM master_events WHERE event_message_id=?", (message_id,))
+
+def set_master_event_message(event_id:int, message_id:int):
+    execute("UPDATE master_events SET event_message_id=? WHERE id=?", (message_id, event_id))
+
+def set_event_reaction(event_id:int, uid:int, reacted:bool):
+    if reacted:
+        execute("INSERT INTO event_reactions (event_id, user_id, reacted_at) VALUES (?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET reacted_at=excluded.reacted_at", (event_id, uid, now_ts()))
+    else:
+        execute("DELETE FROM event_reactions WHERE event_id=? AND user_id=?", (event_id, uid))
+
+def has_event_reaction(event_id:int, uid:int)->bool:
+    return fetchone("SELECT 1 FROM event_reactions WHERE event_id=? AND user_id=?", (event_id, uid)) is not None
+
+def list_event_reactors(event_id:int):
+    return fetchall("SELECT * FROM event_reactions WHERE event_id=? ORDER BY reacted_at ASC", (event_id,))
+
+def render_mastertasks_text(uid:int)->str:
+    wallet=get_master_wallet(uid)
+    return (
+        f"<b>Дела Мастера</b>\n\n"
+        f"Ваш баланс: <b>{format_seals_tenths(wallet['seals_tenths'])}</b>\n"
+        f"Курс: <b>1◈ = 100❂</b>\n\n"
+        f"Заработок:\n"
+        f"• одобрение или отказ работы/задачи — 0.1◈\n"
+        f"• создание собственной задачи — 10◈\n"
+        f"• создание события — 50◈\n"
+        f"• добавление предмета — от 2◈ до 80◈ по редкости\n\n"
+        f"Команды:\n"
+        f"/grant @user xp|lux amount причина\n"
+        f"/sealconvert 1.0\n"
+        f"/mtask_add\n"
+        f"/mevent_add\n"
+        f"/mitem_add\n"
+        f"/endevent id @user1 @user2 ..."
+    )
+
+def send_admin_submission_review(kind:str, sub_id:int, text:str):
+    kb=types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adminreview:{kind}:approve:{sub_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"adminreview:{kind}:reject:{sub_id}")
+    )
+    bot.send_message(ADMIN_ID, text, reply_markup=kb)
+
+def create_event_post(event_id:int):
+    event=get_master_event(event_id)
+    text=(
+        f"<b>Событие #{event['id']}</b>\n"
+        f"{event['title']}\n\n"
+        f"{event['description']}\n\n"
+        f"Награда: <b>{event['reward_lux']}❂</b>\n"
+        f"Чтобы участвовать, отметьтесь реакцией 👍 на это сообщение.\n"
+        f"После завершения Мастер укажет тех, кто действительно выполнил событие."
+    )
+    sent=bot.send_message(GUILD_CHAT_ID, text, message_thread_id=EVENTS_THREAD_ID)
+    set_master_event_message(event_id, sent.message_id)
+    return sent
+
+def complete_event_and_reward(event_id:int, finisher_id:int, approved_user_ids:list[int]):
+    event=get_master_event(event_id)
+    if event is None:
+        raise RuntimeError("Событие не найдено.")
+    if event['status']!='active':
+        raise RuntimeError("Событие уже завершено.")
+    valid=[]
+    for uid in approved_user_ids:
+        if has_event_reaction(event_id, uid) and get_player(uid) is not None:
+            valid.append(uid)
+    for uid in valid:
+        update_player_lux(uid, int(event['reward_lux']), 'master_event_reward', finisher_id, f"event_id={event_id}")
+    execute("UPDATE master_events SET status='completed', completed_at=? WHERE id=?", (now_ts(), event_id))
+    winners=', '.join(user_label_by_id(uid) for uid in valid) if valid else 'никто'
+    bot.send_message(GUILD_CHAT_ID, f"<b>Событие #{event_id} завершено.</b>\nНаграждены: {winners}", message_thread_id=EVENTS_THREAD_ID)
+    return valid
+
+def grant_from_master_balance(master_id:int, player_id:int, resource:str, amount:int, reason:str):
+    if amount<=0:
+        raise RuntimeError("Сумма должна быть положительной.")
+    cost_tenths=calculate_master_grant_cost_tenths(resource, amount)
+    wallet=get_master_wallet(master_id)
+    if int(wallet['seals_tenths'])<cost_tenths:
+        raise RuntimeError(f"Недостаточно Печатей. Нужно {format_seals_tenths(cost_tenths)}.")
+    update_master_seals(master_id, -cost_tenths, f"grant_{resource}", master_id, f"player_id={player_id};reason={reason}")
+    if resource=='xp':
+        player=update_player_xp(player_id, amount, None, f"master_grant:{reason}", master_id)
+    else:
+        player=update_player_lux(player_id, amount, f"master_grant:{reason}", master_id)
+    announce_master_action(f"<b>Награждение Мастера</b>\nМастер: {user_label_by_id(master_id)}\nИгрок: {player_public_label(player)}\nНаграда: <b>{amount}{'✶' if resource=='xp' else '❂'}</b>\nСписано Печатей: <b>{format_seals_tenths(cost_tenths)}</b>\nПричина: {reason}")
+    return player, cost_tenths
+
+def convert_seals_to_lux(uid:int, seals_tenths:int):
+    if seals_tenths<=0:
+        raise RuntimeError("Нужно указать положительное количество Печатей.")
+    wallet=get_master_wallet(uid)
+    if int(wallet['seals_tenths'])<seals_tenths:
+        raise RuntimeError("Недостаточно Печатей.")
+    gross, fee, net = calculate_sealconvert_lux(seals_tenths, fee_percent=8)
+    update_master_seals(uid, -seals_tenths, 'seal_convert', uid, f'gross={gross};fee={fee}')
+    player=update_player_lux(uid, net, 'seal_convert', uid, f'fee={fee}')
+    return player, gross, fee, net
+
+def assign_master_role(uid:int):
+    if uid!=ADMIN_ID:
+        set_role_override(uid, 'master')
+        ensure_master_wallet(uid)
+
+def master_can_manage_event(uid:int, event)->bool:
+    return uid==ADMIN_ID or int(event['creator_id'])==uid
+
+def send_private_if_possible(uid:int, text:str):
+    try:
+        bot.send_message(uid, text)
+    except Exception:
+        pass
+
+def get_player(uid:int): return fetchone("SELECT * FROM players WHERE user_id=?", (uid,))
+def get_player_by_username(username:str): return fetchone("SELECT * FROM players WHERE lower(username)=?", (username.strip().lstrip("@").lower(),))
+def resolve_player_ref(ref:str): return get_player(int(ref)) if ref.strip().lstrip("-").isdigit() else get_player_by_username(ref)
+
+def create_or_update_about(user, about_text:str):
+    ts=now_ts(); existing=get_player(user.id)
+    if existing is None:
+        execute("INSERT INTO players (user_id, username, first_name, about_text, xp, lux, level, title, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, 0, 'без звания', ?, ?)", (user.id, user.username or "", user.first_name or "", about_text, ts, ts))
+    else:
+        execute("UPDATE players SET username=?, first_name=?, about_text=?, updated_at=? WHERE user_id=?", (user.username or "", user.first_name or "", about_text, ts, user.id))
+    return get_player(user.id)
+
+def update_player_about_only(uid:int, about_text:str):
+    execute("UPDATE players SET about_text=?, updated_at=? WHERE user_id=?", (about_text, now_ts(), uid)); return get_player(uid)
+
+def log_economy(actor,target,res,delta,reason,meta=None): execute("INSERT INTO economy_ledger (actor_user_id,target_user_id,resource,delta,reason,meta,created_at) VALUES (?,?,?,?,?,?,?)", (actor,target,res,delta,reason,meta,now_ts()))
+
+def update_player_xp(uid:int, delta:int, submission_id:Optional[int], reason:str, actor_user_id:Optional[int]=None):
+    player=get_player(uid)
+    if player is None: raise RuntimeError("Player not found")
+    new_xp=max(0,int(player["xp"])+delta); st=build_level_state(new_xp); ts=now_ts()
+    execute("UPDATE players SET xp=?, level=?, title=?, updated_at=? WHERE user_id=?", (new_xp, st.level, st.title, ts, uid))
+    execute("INSERT INTO xp_log (user_id, submission_id, delta, reason, created_at) VALUES (?, ?, ?, ?, ?)", (uid, submission_id, delta, reason, ts))
+    log_economy(actor_user_id, uid, "xp", delta, reason, f"submission_id={submission_id}" if submission_id else None)
+    updated=get_player(uid)
+    refresh_last_leaders_message_if_exists()
+    return updated
+
+def update_player_lux(uid:int, delta:int, reason:str, actor_user_id:Optional[int]=None, meta:Optional[str]=None):
+    player=get_player(uid)
+    if player is None: raise RuntimeError("Player not found")
+    new_lux=max(0,int(player["lux"])+delta); ts=now_ts()
+    execute("UPDATE players SET lux=?, updated_at=? WHERE user_id=?", (new_lux, ts, uid))
+    execute("INSERT INTO lux_log (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)", (uid, delta, reason, ts))
+    log_economy(actor_user_id, uid, "lux", delta, reason, meta)
+    return get_player(uid)
+
+def convert_xp_to_lux(uid:int, xp_amount:int):
+    player=get_player(uid)
+    if player is None: raise RuntimeError("Player not found")
+    if xp_amount<=0 or xp_amount%XP_TO_LUX_RATE!=0: raise RuntimeError(f"Отправьте положительное число, кратное {XP_TO_LUX_RATE}")
+    if int(player["xp"])<xp_amount: raise RuntimeError("Недостаточно опыта")
+    lux_amount=xp_amount//XP_TO_LUX_RATE
+    return update_player_xp(uid,-xp_amount,None,"xp_to_lux",uid), update_player_lux(uid,lux_amount,"xp_to_lux",uid,f"xp_spent={xp_amount}"), lux_amount
+
+def transfer_lux(sender_uid:int, receiver_uid:int, amount:int):
+    if sender_uid==receiver_uid: raise RuntimeError("Нельзя переводить себе")
+    if amount<=0: raise RuntimeError("Сумма перевода должна быть положительной")
+    s=get_player(sender_uid); r=get_player(receiver_uid)
+    if s is None or r is None: raise RuntimeError("Игрок не найден")
+    if int(s["lux"])<amount: raise RuntimeError("Недостаточно люксов")
+    update_player_lux(sender_uid,-amount,"transfer_out",sender_uid,f"to={receiver_uid}")
+    update_player_lux(receiver_uid,amount,"transfer_in",sender_uid,f"from={sender_uid}")
+    return get_player(sender_uid), get_player(receiver_uid)
+
+def set_last_work_time(uid:int, ts:int): execute("UPDATE players SET last_work_at=?, updated_at=? WHERE user_id=?", (ts, ts, uid))
+
+def create_submission(uid, chat_id, msg_id, thread_id): return execute("INSERT INTO submissions (user_id, source_chat_id, source_message_id, source_thread_id, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)", (uid,chat_id,msg_id,thread_id,now_ts()))
+def get_submission(sid:int): return fetchone("SELECT * FROM submissions WHERE id=?", (sid,))
+def get_submission_by_control_message(mid:int): return fetchone("SELECT * FROM submissions WHERE masters_control_message_id=?", (mid,))
+def link_submission_review_messages(sid:int, copy_mid:int, ctrl_mid:int): execute("UPDATE submissions SET masters_copy_message_id=?, masters_control_message_id=? WHERE id=?", (copy_mid, ctrl_mid, sid))
+def set_submission_status(sid:int, status:str, reviewer_id=None, awarded_xp=None, reject_reason=None): execute("UPDATE submissions SET status=?, reviewed_at=?, reviewer_id=?, awarded_xp=?, reject_reason=? WHERE id=?", (status, now_ts(), reviewer_id, awarded_xp, reject_reason, sid))
+
+def rarity_label(code:str)->str: return RARITY_MAP.get(code, code)
+def create_shop_item(name,description,price,rarity,download_url=None):
+    if rarity not in RARITY_MAP: raise RuntimeError("Unknown rarity")
+    ts=now_ts(); item_id=execute("INSERT INTO shop_items (name,description,price_lux,rarity,download_url,is_active,created_at,updated_at) VALUES (?,?,?,?,?,1,?,?)", (name,description,price,rarity,download_url,ts,ts)); return get_shop_item(item_id)
+def get_shop_item(item_id:int): return fetchone("SELECT * FROM shop_items WHERE id=?", (item_id,))
+def count_active_shop_items()->int: return int(fetchone("SELECT COUNT(*) c FROM shop_items WHERE is_active=1")["c"])
+def list_active_shop_items(page:int, page_size:int=SHOP_PAGE_SIZE): return fetchall("SELECT * FROM shop_items WHERE is_active=1 ORDER BY id ASC LIMIT ? OFFSET ?", (page_size,max(0,(page-1)*page_size)))
+def update_shop_item_price(item_id:int,new_price:int): execute("UPDATE shop_items SET price_lux=?, updated_at=? WHERE id=?", (new_price,now_ts(),item_id)); return get_shop_item(item_id)
+def set_shop_item_active(item_id:int,is_active:bool): execute("UPDATE shop_items SET is_active=?, updated_at=? WHERE id=?", (1 if is_active else 0,now_ts(),item_id)); return get_shop_item(item_id)
+def list_inventory(uid:int): return fetchall("SELECT * FROM inventory WHERE user_id=? ORDER BY item_name ASC", (uid,))
+def get_inventory_item(uid:int,item_id:int): return fetchone("SELECT * FROM inventory WHERE user_id=? AND item_id=?", (uid,item_id))
+def add_inventory_item(uid:int,item_id:int,item_name:str):
+    if get_inventory_item(uid,item_id) is None: execute("INSERT INTO inventory (user_id,item_id,item_name,quantity,acquired_at) VALUES (?, ?, ?, 1, ?)", (uid,item_id,item_name,now_ts()))
+def buy_shop_item(uid:int,item_id:int):
+    player=get_player(uid); item=get_shop_item(item_id)
+    if player is None: raise RuntimeError("Игрок не найден")
+    if item is None or int(item["is_active"])!=1: raise RuntimeError("Предмет недоступен")
+    if get_inventory_item(uid,item_id) is not None: raise RuntimeError("Этот предмет уже есть в вашем инвентаре")
+    if int(player["lux"])<int(item["price_lux"]): raise RuntimeError("Недостаточно люксов")
+    update_player_lux(uid,-int(item["price_lux"]),"shop_purchase",uid,f"item_id={item_id}")
+    add_inventory_item(uid,int(item["id"]),item["name"])
+    return get_player(uid), item
+
+def create_task(title, description, reward_lux):
+    ts=now_ts(); task_id=execute("INSERT INTO tasks (title,description,reward_lux,is_active,created_at,updated_at) VALUES (?,?,?,1,?,?)", (title,description,reward_lux,ts,ts)); return get_task(task_id)
+def get_task(task_id:int): return fetchone("SELECT * FROM tasks WHERE id=?", (task_id,))
+def count_active_tasks()->int: return int(fetchone("SELECT COUNT(*) c FROM tasks WHERE is_active=1")["c"])
+def list_active_tasks(page:int, page_size:int=TASK_PAGE_SIZE): return fetchall("SELECT * FROM tasks WHERE is_active=1 ORDER BY id ASC LIMIT ? OFFSET ?", (page_size,max(0,(page-1)*page_size)))
+def set_task_active(task_id:int,is_active:bool): execute("UPDATE tasks SET is_active=?, updated_at=? WHERE id=?", (1 if is_active else 0, now_ts(), task_id)); return get_task(task_id)
+def update_task_reward(task_id:int,reward:int): execute("UPDATE tasks SET reward_lux=?, updated_at=? WHERE id=?", (reward, now_ts(), task_id)); return get_task(task_id)
+
+def get_active_task_claim(uid:int, task_id:int): return fetchone("SELECT * FROM task_claims WHERE user_id=? AND task_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1", (uid,task_id,TASK_STATUS_ACTIVE,TASK_STATUS_SUBMITTED))
+def create_task_claim(task_id:int, uid:int):
+    if get_active_task_claim(uid,task_id) is not None: raise RuntimeError("У вас уже есть активное выполнение этого задания")
+    cid=execute("INSERT INTO task_claims (task_id,user_id,status,created_at) VALUES (?, ?, ?, ?)", (task_id,uid,TASK_STATUS_ACTIVE,now_ts())); return get_task_claim(cid)
+def get_task_claim(cid:int): return fetchone("SELECT * FROM task_claims WHERE id=?", (cid,))
+def get_task_claim_by_control_message(mid:int): return fetchone("SELECT * FROM task_claims WHERE masters_control_message_id=?", (mid,))
+def get_user_task_history(uid:int): return fetchall("SELECT tc.*, t.title, t.reward_lux FROM task_claims tc JOIN tasks t ON t.id=tc.task_id WHERE tc.user_id=? ORDER BY tc.id DESC LIMIT 20", (uid,))
+def submit_task_claim(cid:int, text:str, control_message_id:int): execute("UPDATE task_claims SET status=?, submission_text=?, submitted_at=?, masters_control_message_id=? WHERE id=?", (TASK_STATUS_SUBMITTED,text,now_ts(),control_message_id,cid))
+def set_task_claim_status(cid:int,status:str, reviewer_id=None, reject_reason=None): execute("UPDATE task_claims SET status=?, reviewed_at=?, reviewer_id=?, reject_reason=? WHERE id=?", (status,now_ts(),reviewer_id,reject_reason,cid))
+
+def today_msk_bounds_ts():
+    now=moscow_now(); start=now.replace(hour=0, minute=0, second=0, microsecond=0); end=start+timedelta(days=1)
+    return int(start.timestamp()), int(end.timestamp())
+
+def get_task_approved_count_today(uid:int)->int:
+    start_ts,end_ts=today_msk_bounds_ts()
+    row=fetchone("SELECT COUNT(*) c FROM task_claims WHERE user_id=? AND status=? AND reviewed_at>=? AND reviewed_at<?", (uid,TASK_STATUS_APPROVED,start_ts,end_ts))
+    return int(row["c"])
+
+def get_leaders(limit:int=20):
+    start_ts,end_ts=today_msk_bounds_ts()
+    return fetchall("SELECT p.user_id,p.username,p.title,p.xp,p.level, COALESCE(SUM(CASE WHEN tc.status=? AND tc.reviewed_at>=? AND tc.reviewed_at<? THEN 1 ELSE 0 END),0) tasks_today FROM players p LEFT JOIN task_claims tc ON tc.user_id=p.user_id GROUP BY p.user_id,p.username,p.title,p.xp,p.level ORDER BY p.xp DESC, p.level DESC LIMIT ?", (TASK_STATUS_APPROVED,start_ts,end_ts,limit))
+
+def get_open_dice_duel_by_creator(uid:int):
+    return fetchone("SELECT * FROM dice_duels WHERE creator_id=? AND status=? ORDER BY id DESC LIMIT 1", (uid, DICE_STATUS_OPEN))
+
+def get_open_dice_duel_for_user(uid:int):
+    return fetchone("SELECT * FROM dice_duels WHERE status=? AND (creator_id=? OR opponent_id=?) ORDER BY id DESC LIMIT 1", (DICE_STATUS_OPEN, uid, uid))
+
+def get_last_dice_created_at(uid:int)->Optional[int]:
+    row=fetchone("SELECT created_at FROM dice_duels WHERE creator_id=? ORDER BY id DESC LIMIT 1", (uid,))
+    return int(row["created_at"]) if row else None
+
+def create_dice_duel(creator_id:int, stake_lux:int, challenge_message_id:int)->int:
+    return execute("INSERT INTO dice_duels (creator_id, stake_lux, status, created_at, challenge_message_id) VALUES (?, ?, ?, ?, ?)", (creator_id, stake_lux, DICE_STATUS_OPEN, now_ts(), challenge_message_id))
+
+def get_dice_duel(duel_id:int):
+    return fetchone("SELECT * FROM dice_duels WHERE id=?", (duel_id,))
+
+def set_dice_duel_message_id(duel_id:int, message_id:int):
+    execute("UPDATE dice_duels SET challenge_message_id=? WHERE id=?", (message_id, duel_id))
+
+def accept_dice_duel(duel_id:int, opponent_id:int):
+    execute("UPDATE dice_duels SET opponent_id=?, accepted_at=? WHERE id=?", (opponent_id, now_ts(), duel_id))
+
+def finish_dice_duel(duel_id:int, creator_roll:int, opponent_roll:int, winner_id:Optional[int], fee_lux:int):
+    execute("UPDATE dice_duels SET status=?, resolved_at=?, creator_roll=?, opponent_roll=?, winner_id=?, fee_lux=? WHERE id=?", (DICE_STATUS_FINISHED, now_ts(), creator_roll, opponent_roll, winner_id, fee_lux, duel_id))
+
+def set_dice_duel_status(duel_id:int, status:str):
+    execute("UPDATE dice_duels SET status=?, resolved_at=? WHERE id=?", (status, now_ts(), duel_id))
+
+def list_expired_open_dice_duels():
+    threshold=now_ts()-DICE_WAIT_SECONDS
+    return fetchall("SELECT * FROM dice_duels WHERE status=? AND created_at<?", (DICE_STATUS_OPEN, threshold))
+
+def dice_pve_daily_count(uid:int)->int:
+    start_of_day = int(datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    row = fetchone("SELECT COUNT(*) c FROM dice_pve_sessions WHERE user_id=? AND created_at>=?", (uid, start_of_day))
+    return int(row['c']) if row else 0
+
+def get_open_dice_pve_session(uid:int):
+    return fetchone("SELECT * FROM dice_pve_sessions WHERE user_id=? AND state='active' ORDER BY id DESC LIMIT 1", (uid,))
+
+def get_dice_pve_session(session_id:int):
+    return fetchone("SELECT * FROM dice_pve_sessions WHERE id=?", (session_id,))
+
+def create_dice_pve_session(uid:int, stake:int, session_message_id:Optional[int]=None):
+    ts = now_ts()
+    session_id = execute(
+        "INSERT INTO dice_pve_sessions (user_id, stake_lux, state, created_at, updated_at, session_message_id) VALUES (?, ?, 'active', ?, ?, ?)",
+        (uid, stake, ts, ts, session_message_id)
+    )
+    return get_dice_pve_session(session_id)
+
+def update_dice_pve_session_message(session_id:int, message_id:int):
+    execute("UPDATE dice_pve_sessions SET session_message_id=?, updated_at=? WHERE id=?", (message_id, now_ts(), session_id))
+
+def styled_inline_button(text:str, callback_data:str, style:Optional[str]=None):
+    try:
+        return types.InlineKeyboardButton(text, callback_data=callback_data, style=style)
+    except TypeError:
+        btn = types.InlineKeyboardButton(text, callback_data=callback_data)
+        if style is not None:
+            try:
+                setattr(btn, 'style', style)
+            except Exception:
+                pass
+        return btn
+
+def dice_pve_offer_text(stake:int)->str:
+    return (
+        "🎲 Испытайте удачу и сыграйте в кости против Кастеляна.\n\n"
+        "Нажмите «Бросить», чтобы начать игру или измените ставку. "
+    )
+
+def dice_pve_offer_keyboard(stake:int):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        styled_inline_button("Бросить", f"dicepveopen:throw:{stake}", style="success"),
+        styled_inline_button(f"Изменить ставку ({stake}❂)", f"dicepveopen:stake:{stake}", style="primary")
+    )
+    return kb
+
+def dice_pve_series_multiplier(wins:int)->float:
+    return DICE_PVE_SERIES_BASE + max(0, wins - 1) * DICE_PVE_SERIES_STEP
+
+def dice_pve_series_payout(stake:int, wins:int)->int:
+    return max(stake, int(ceil(stake * dice_pve_series_multiplier(wins))))
+
+def dice_pve_series_fee(stake:int, payout:int)->int:
+    return max(0, payout - stake)
+
+def dice_pve_action_keyboard(session_id:int):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        styled_inline_button("Остановиться", f"dicepve:cashout:{session_id}", style="primary"),
+        styled_inline_button("Рискнуть", f"dicepve:risk:{session_id}", style="danger")
+    )
+    return kb
+
+def dice_pve_update_round(session_id:int, player_roll:int, bot_roll:int, wins:int, payout:int, fee:int):
+    execute(
+        "UPDATE dice_pve_sessions "
+        "SET updated_at=?, player_roll_1=?, bot_roll_1=?, player_total=?, bot_total=?, "
+        "player_stands=?, payout_lux=?, fee_lux=?, result='win' "
+        "WHERE id=?",
+        (
+            now_ts(),
+            int(player_roll),
+            int(bot_roll),
+            int(player_roll),
+            int(bot_roll),
+            int(wins),
+            int(payout),
+            int(fee),
+            session_id
+        )
+    )
+    return get_dice_pve_session(session_id)
+
+def finish_dice_pve_loss(session_id:int, player_roll:int, bot_roll:int):
+    ts = now_ts()
+    execute(
+        "UPDATE dice_pve_sessions "
+        "SET state='finished', updated_at=?, finished_at=?, "
+        "player_roll_1=?, bot_roll_1=?, player_total=?, bot_total=?, "
+        "result='loss', payout_lux=0, fee_lux=stake_lux "
+        "WHERE id=?",
+        (
+            ts,
+            ts,
+            int(player_roll),
+            int(bot_roll),
+            int(player_roll),
+            int(bot_roll),
+            session_id
+        )
+    )
+    return get_dice_pve_session(session_id)
+
+def finish_dice_pve_cashout(session_id:int):
+    with db_transaction() as conn:
+        cur = conn.cursor()
+        session = cur.execute(
+            "SELECT * FROM dice_pve_sessions WHERE id=?",
+            (session_id,)
+        ).fetchone()
+        if session is None:
+            raise RuntimeError("Сессия не найдена.")
+        if session["state"] != "active":
+            return get_dice_pve_session(session_id)
+
+        payout = int(session["payout_lux"] or 0)
+        ts = now_ts()
+
+        cur.execute(
+            "UPDATE dice_pve_sessions "
+            "SET state='finished', updated_at=?, finished_at=?, result='cashout' "
+            "WHERE id=?",
+            (ts, ts, session_id)
+        )
+
+        if payout > 0:
+            player = cur.execute(
+                "SELECT * FROM players WHERE user_id=?",
+                (int(session["user_id"]),)
+            ).fetchone()
+            if player is None:
+                raise RuntimeError("Игрок не найден.")
+
+            new_lux = int(player["lux"]) + payout
+            cur.execute(
+                "UPDATE players SET lux=?, updated_at=? WHERE user_id=?",
+                (new_lux, ts, int(session["user_id"]))
+            )
+
+            meta = (
+                f"session_id={session_id};"
+                f"stake={int(session['stake_lux'])};"
+                f"wins={int(session['player_stands'] or 0)}"
+            )
+
+            cur.execute(
+                "INSERT INTO lux_log (user_id, delta, reason, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (int(session["user_id"]), payout, "dice_pve_cashout", ts)
+            )
+            cur.execute(
+                "INSERT INTO economy_ledger "
+                "(actor_user_id, target_user_id, resource, delta, reason, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(session["user_id"]),
+                    int(session["user_id"]),
+                    "lux",
+                    payout,
+                    "dice_pve_cashout",
+                    meta,
+                    ts
+                )
+            )
+
+    return get_dice_pve_session(session_id)
+
+def dice_pve_win_text(session)->str:
+    wins = int(session["player_stands"] or 0)
+    payout = int(session["payout_lux"] or 0)
+    fee = int(session["fee_lux"] or 0)
+    return (
+        "Удача улыбнулась вам. Вы можете забрать выигрыш или рискнуть ради ещё большего выигрыша.\n\n"
+        f"Ваш бросок: <b>{int(session['player_roll_1'])}</b>\n"
+        f"Бросок Кастеляна: <b>{int(session['bot_roll_1'])}</b>\n"
+        f"Побед в серии: <b>{wins}</b>\n"
+        f"Текущий выигрыш: <b>{payout}❂</b>\n\n"
+        f"Пошлина Цитадели: <b>{fee}❂</b>"
+    )
+
+def dice_pve_loss_text(session)->str:
+    return f"Кастеляну повезло больше. Вы проиграли: <b>{int(session['stake_lux'])}❂</b>"
+
+def dice_pve_cashout_text(user_id:int)->str:
+    player = get_player(user_id)
+    balance = int(player["lux"]) if player else 0
+    return f"Новый баланс: <b>{balance}❂</b>"
+
+def show_dice_pve_offer(chat_id:int, stake:int, message_id:Optional[int]=None):
+    text = dice_pve_offer_text(stake)
+    kb = dice_pve_offer_keyboard(stake)
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+            return message_id
+        except Exception:
+            pass
+
+    sent = bot.send_message(chat_id, text, reply_markup=kb)
+    return int(sent.message_id)
+
+def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_id:Optional[int]=None):
+    if get_open_dice_pve_session(user_id) is not None:
+        raise RuntimeError("У вас уже есть незавершённая партия с Кастеляном.")
+
+    if (not is_admin(user_id)) and dice_pve_daily_count(user_id) >= DICE_PVE_DAILY_LIMIT:
+        raise RuntimeError(f"На сегодня лимит партий исчерпан: {DICE_PVE_DAILY_LIMIT}.")
+
+    player = get_player(user_id)
+    if player is None:
+        raise RuntimeError("Профиль не найден. Сначала расскажите о себе в теме знакомства.")
+    if int(player["lux"]) < stake:
+        raise RuntimeError("Недостаточно люксов для такой ставки.")
+
+    update_player_lux(user_id, -stake, "dice_pve_stake", user_id, f"stake={stake}")
+
+    session = None
+    try:
+        session = create_dice_pve_session(user_id, stake, session_message_id=session_message_id)
+
+        player_die = bot.send_dice(chat_id, emoji="🎲")
+        bot_die = bot.send_dice(chat_id, emoji="🎲")
+        time.sleep(4.2)
+
+        player_roll = int(player_die.dice.value)
+        bot_roll = int(bot_die.dice.value)
+
+        if player_roll > bot_roll:
+            payout = dice_pve_series_payout(stake, 1)
+            fee = dice_pve_series_fee(stake, payout)
+            session = dice_pve_update_round(
+                int(session["id"]),
+                player_roll,
+                bot_roll,
+                1,
+                payout,
+                fee
+            )
+
+            if session_message_id:
+                try:
+                    bot.edit_message_text(
+                        dice_pve_win_text(session),
+                        chat_id,
+                        int(session_message_id),
+                        reply_markup=dice_pve_action_keyboard(int(session["id"]))
+                    )
+                except Exception:
+                    sent = bot.send_message(
+                        chat_id,
+                        dice_pve_win_text(session),
+                        reply_markup=dice_pve_action_keyboard(int(session["id"]))
+                    )
+                    update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
+            else:
+                sent = bot.send_message(
+                    chat_id,
+                    dice_pve_win_text(session),
+                    reply_markup=dice_pve_action_keyboard(int(session["id"]))
+                )
+                update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
+
+            return session
+
+        session = finish_dice_pve_loss(int(session["id"]), player_roll, bot_roll)
+        loss_text = dice_pve_loss_text(session)
+
+        if session_message_id:
+            try:
+                bot.edit_message_text(loss_text, chat_id, int(session_message_id), reply_markup=None)
+            except Exception:
+                bot.send_message(chat_id, loss_text)
+        else:
+            bot.send_message(chat_id, loss_text)
+
+        return session
+
+    except Exception:
+        logging.exception("[DICE_PVE] failed to start series")
+
+        if session is not None:
+            try:
+                execute(
+                    "UPDATE dice_pve_sessions "
+                    "SET state='finished', updated_at=?, finished_at=?, result='error' "
+                    "WHERE id=?",
+                    (now_ts(), now_ts(), int(session["id"]))
+                )
+            except Exception:
+                logging.exception("[DICE_PVE] failed to mark errored session")
+
+        try:
+            update_player_lux(user_id, stake, "dice_pve_refund_error", user_id, f"stake={stake}")
+        except Exception:
+            logging.exception("[DICE_PVE] failed to refund after series start error")
+
+        raise
+
+def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
+    session = get_dice_pve_session(session_id)
+    if session is None:
+        raise RuntimeError("Сессия не найдена.")
+    if session["state"] != "active":
+        return session
+
+    if action == "cashout":
+        final_session = finish_dice_pve_cashout(session_id)
+        text = dice_pve_cashout_text(int(final_session["user_id"]))
+
+        if final_session["session_message_id"]:
+            try:
+                bot.edit_message_text(
+                    text,
+                    chat_id,
+                    int(final_session["session_message_id"]),
+                    reply_markup=None
+                )
+            except Exception:
+                bot.send_message(chat_id, text)
+        else:
+            bot.send_message(chat_id, text)
+
+        return final_session
+
+    if action != "risk":
+        raise RuntimeError("Некорректное действие.")
+
+    player_die = bot.send_dice(chat_id, emoji="🎲")
+    bot_die = bot.send_dice(chat_id, emoji="🎲")
+    time.sleep(4.2)
+
+    player_roll = int(player_die.dice.value)
+    bot_roll = int(bot_die.dice.value)
+
+    if player_roll > bot_roll:
+        wins = int(session["player_stands"] or 0) + 1
+        payout = dice_pve_series_payout(int(session["stake_lux"]), wins)
+        fee = dice_pve_series_fee(int(session["stake_lux"]), payout)
+        active_session = dice_pve_update_round(
+            session_id,
+            player_roll,
+            bot_roll,
+            wins,
+            payout,
+            fee
+        )
+
+        text = dice_pve_win_text(active_session)
+
+        if active_session["session_message_id"]:
+            try:
+                bot.edit_message_text(
+                    text,
+                    chat_id,
+                    int(active_session["session_message_id"]),
+                    reply_markup=dice_pve_action_keyboard(session_id)
+                )
+            except Exception:
+                bot.send_message(
+                    chat_id,
+                    text,
+                    reply_markup=dice_pve_action_keyboard(session_id)
+                )
+        else:
+            sent = bot.send_message(
+                chat_id,
+                text,
+                reply_markup=dice_pve_action_keyboard(session_id)
+            )
+            update_dice_pve_session_message(session_id, int(sent.message_id))
+
+        return active_session
+
+    final_session = finish_dice_pve_loss(session_id, player_roll, bot_roll)
+    text = dice_pve_loss_text(final_session)
+
+    if final_session["session_message_id"]:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id,
+                int(final_session["session_message_id"]),
+                reply_markup=None
+            )
+        except Exception:
+            bot.send_message(chat_id, text)
+    else:
+        bot.send_message(chat_id, text)
+
+    return final_session
 
 def user_label_by_id(uid:int)->str:
     p=get_player(uid)
@@ -1800,26 +2498,21 @@ def cmd_tasks(m):
 def cmd_dicebot(m):
     if not ensure_dice_access(m):
         return
+
     if not is_private_chat(m):
-        temp_reply(m, "Для игры с Цитаделью используйте команду /dicebot в личке с ботом.")
+        temp_reply(m, "Для игры с Кастеляном используйте команду /dicebot в личке с ботом.")
         return
-    parts = get_message_text(m).split()
-    if len(parts) != 2:
-        temp_reply(m, f"Формат: /dicebot сумма\nСтавка от {DICE_MIN_STAKE} до {DICE_MAX_STAKE} люксов.")
-        return
-    try:
-        stake = int(parts[1])
-    except ValueError:
-        temp_reply(m, "Ставка должна быть целым числом.")
-        return
-    if stake < DICE_MIN_STAKE or stake > DICE_MAX_STAKE:
-        temp_reply(m, f"Ставка должна быть от {DICE_MIN_STAKE} до {DICE_MAX_STAKE} люксов.")
-        return
+
     player = get_player(m.from_user.id)
     if player is None:
         temp_reply(m, "Профиль не найден. Сначала расскажите о себе в теме знакомства.")
         return
-    play_dice_pve_round(m, stake)
+
+    if get_open_dice_pve_session(m.from_user.id) is not None:
+        temp_reply(m, "У вас уже есть незавершённая партия с Кастеляном.")
+        return
+
+    show_dice_pve_offer(m.chat.id, DICE_PVE_DEFAULT_STAKE)
 
 @bot.message_handler(commands=["dice"])
 def cmd_dice(m):
@@ -2348,6 +3041,27 @@ def handle_conversation_flow_message(m, conv):
         bot.send_message(m.chat.id, 'Выполнение отправлено Мастерам на рассмотрение.')
         return True
 
+    if flow == 'dice_pve_setup':
+        if step == 'stake':
+            if not txt.isdigit():
+                bot.reply_to(m, f"Ставка должна быть целым числом от {DICE_MIN_STAKE} до {DICE_MAX_STAKE}.")
+                return True
+
+            stake = int(txt)
+            if stake < DICE_MIN_STAKE or stake > DICE_MAX_STAKE:
+                bot.reply_to(m, f"Ставка должна быть от {DICE_MIN_STAKE} до {DICE_MAX_STAKE} люксов.")
+                return True
+
+            clear_conversation_with_prompt(m.from_user.id)
+            safe_delete(m.chat.id, m.message_id)
+
+            show_dice_pve_offer(
+                int(data.get("chat_id") or m.chat.id),
+                stake,
+                message_id=int(data.get("message_id") or 0) or None
+            )
+            return True
+
     if flow == 'mtask_add' and is_master(m.from_user.id):
         if step == 'title':
             data['title']=txt; conversation_update(m.from_user.id, step='description', data=data); send_prompt('mtask_add', m.from_user.id, 'Теперь отправьте описание задания.'); return True
@@ -2760,42 +3474,120 @@ def cb_inventory(c):
         except Exception: bot.send_message(c.message.chat.id,text,reply_markup=kb)
         bot.answer_callback_query(c.id); return
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dicepveopen:"))
+def cb_dice_pve_open(c):
+    if needs_verification(c.from_user.id):
+        bot.answer_callback_query(c.id, "Сначала пройдите верификацию.")
+        return
+
+    if get_player(c.from_user.id) is None:
+        bot.answer_callback_query(c.id, "Сначала создайте профиль.")
+        return
+
+    parts = c.data.split(":")
+    if len(parts) != 3:
+        bot.answer_callback_query(c.id, "Некорректное действие.")
+        return
+
+    action = parts[1]
+    try:
+        stake = int(parts[2])
+    except ValueError:
+        bot.answer_callback_query(c.id, "Некорректная ставка.")
+        return
+
+    if action == "stake":
+        conversation_set(
+            c.from_user.id,
+            "dice_pve_setup",
+            "stake",
+            {
+                "chat_id": c.message.chat.id,
+                "message_id": c.message.message_id
+            },
+            "dice_pve_setup"
+        )
+        send_prompt(
+            "dice_pve_setup",
+            c.from_user.id,
+            f"Введите новую ставку от {DICE_MIN_STAKE} до {DICE_MAX_STAKE} люксов."
+        )
+        bot.answer_callback_query(c.id)
+        return
+
+    if action != "throw":
+        bot.answer_callback_query(c.id, "Некорректное действие.")
+        return
+
+    try:
+        start_dice_pve_series(
+            c.message.chat.id,
+            c.from_user.id,
+            stake,
+            session_message_id=c.message.message_id
+        )
+        bot.answer_callback_query(c.id, "Бросок принят.")
+    except RuntimeError as exc:
+        bot.answer_callback_query(c.id, str(exc), show_alert=True)
+    except Exception:
+        logging.exception("[DICE_PVE] failed to open series from lobby")
+        bot.answer_callback_query(c.id, "Не удалось начать партию.", show_alert=True)
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dicepve:"))
 def cb_dice_pve(c):
     if needs_verification(c.from_user.id):
         bot.answer_callback_query(c.id, "Сначала пройдите верификацию.")
         return
+
     if get_player(c.from_user.id) is None:
         bot.answer_callback_query(c.id, "Сначала создайте профиль.")
         return
+
     parts = c.data.split(":")
     if len(parts) != 3:
         bot.answer_callback_query(c.id, "Некорректное действие.")
         return
+
     action = parts[1]
     session_id = int(parts[2])
     session = get_dice_pve_session(session_id)
+
     if session is None:
         bot.answer_callback_query(c.id, "Партия не найдена.")
         return
-    if int(session['user_id']) != c.from_user.id:
+
+    if int(session["user_id"]) != c.from_user.id:
         bot.answer_callback_query(c.id, "Это не ваша партия.")
         return
-    if session['state'] != 'await_choice':
+
+    if session["state"] != "active":
         bot.answer_callback_query(c.id, "Партия уже завершена.")
         return
+
+    if action not in ("risk", "cashout"):
+        bot.answer_callback_query(c.id, "Некорректное действие.")
+        return
+
     action_key = f"dice_pve:{session_id}:{action}"
+
     def _resolve_once():
         return resolve_dice_pve_choice(session_id, action, c.message.chat.id)
+
     try:
         processed, _ = execute_once(action_key, _resolve_once, meta=f"user={c.from_user.id}")
         if not processed:
             bot.answer_callback_query(c.id, "Ход уже обработан.")
             return
-        bot.answer_callback_query(c.id, "Ход принят.")
+
+        if action == "cashout":
+            bot.answer_callback_query(c.id, "Вы забрали выигрыш.")
+        else:
+            bot.answer_callback_query(c.id, "Бросок выполнен.")
+    except RuntimeError as exc:
+        bot.answer_callback_query(c.id, str(exc), show_alert=True)
     except Exception:
-        logging.exception('[DICE_PVE] failed to resolve choice')
-        bot.answer_callback_query(c.id, "Не удалось завершить ход.", show_alert=True)
+        logging.exception("[DICE_PVE] failed to resolve choice")
+        bot.answer_callback_query(c.id, "Не удалось обработать ход.", show_alert=True)
         return
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dice:"))
