@@ -85,7 +85,7 @@ DICE_MAX_STAKE=100
 DICE_COOLDOWN_SECONDS=180
 DICE_WAIT_SECONDS=300
 DICE_FEE_PERCENT=4
-DICE_PVE_DAILY_LIMIT=10
+DICE_PVE_DAILY_LIMIT=20
 DICE_PVE_DEFAULT_STAKE=DICE_MIN_STAKE
 DICE_PVE_SERIES_BASE=1.5
 DICE_PVE_SERIES_STEP=0.5
@@ -958,8 +958,35 @@ def dice_pve_daily_count(uid:int)->int:
     row = fetchone("SELECT COUNT(*) c FROM dice_pve_sessions WHERE user_id=? AND created_at>=?", (uid, start_of_day))
     return int(row['c']) if row else 0
 
-def get_open_dice_pve_session(uid:int):
-    return fetchone("SELECT * FROM dice_pve_sessions WHERE user_id=? AND state='active' ORDER BY id DESC LIMIT 1", (uid,))
+def get_open_dice_pve_session(uid:int, max_age_seconds:int=1800):
+    row = fetchone("SELECT * FROM dice_pve_sessions WHERE user_id=? AND state='active' ORDER BY id DESC LIMIT 1", (uid,))
+    if row is None:
+        return None
+
+    updated_at = int(row['updated_at'] or 0)
+    created_at = int(row['created_at'] or 0)
+    last_ts = max(updated_at, created_at)
+    age = now_ts() - last_ts
+
+    if age > max_age_seconds:
+        execute(
+            "UPDATE dice_pve_sessions SET state='finished', result='cancelled', updated_at=?, finished_at=? WHERE id=?",
+            (now_ts(), now_ts(), int(row['id']))
+        )
+        return None
+
+    return row
+
+def cancel_open_dice_pve_session(uid:int):
+    row = fetchone("SELECT * FROM dice_pve_sessions WHERE user_id=? AND state='active' ORDER BY id DESC LIMIT 1", (uid,))
+    if row is None:
+        return False
+
+    execute(
+        "UPDATE dice_pve_sessions SET state='finished', result='cancelled', updated_at=?, finished_at=? WHERE id=?",
+        (now_ts(), now_ts(), int(row['id']))
+    )
+    return True
 
 def get_dice_pve_session(session_id:int):
     return fetchone("SELECT * FROM dice_pve_sessions WHERE id=?", (session_id,))
@@ -1015,6 +1042,13 @@ def dice_pve_action_keyboard(session_id:int):
     kb.row(
         styled_inline_button("Остановиться", f"dicepve:cashout:{session_id}", style="primary"),
         styled_inline_button("Рискнуть", f"dicepve:risk:{session_id}", style="danger")
+    )
+    return kb
+
+def dice_pve_retry_keyboard(stake:int):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        styled_inline_button("Попробовать ещё раз", f"dicepveopen:throw:{stake}", style="primary")
     )
     return kb
 
@@ -1138,6 +1172,9 @@ def dice_pve_win_text(session)->str:
 def dice_pve_loss_text(session)->str:
     return f"Кастеляну повезло больше. Вы проиграли: <b>{int(session['stake_lux'])}❂</b>"
 
+def dice_pve_loss_reply_markup(session):
+    return dice_pve_retry_keyboard(int(session["stake_lux"]))
+
 def dice_pve_cashout_text(user_id:int)->str:
     player = get_player(user_id)
     balance = int(player["lux"]) if player else 0
@@ -1225,9 +1262,9 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
 
         if session_message_id:
             try:
-                bot.edit_message_text(loss_text, chat_id, int(session_message_id), reply_markup=None)
+                bot.edit_message_text(loss_text, chat_id, int(session_message_id), reply_markup=dice_pve_loss_reply_markup(session))
             except Exception:
-                bot.send_message(chat_id, loss_text)
+                bot.send_message(chat_id, loss_text, reply_markup=dice_pve_loss_reply_markup(session))
         else:
             bot.send_message(chat_id, loss_text)
 
@@ -1254,7 +1291,7 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
 
         raise
 
-def legacy_resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
+def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
     session = legacy_get_dice_pve_session(session_id)
     if session is None:
         raise RuntimeError("Сессия не найдена.")
@@ -1274,7 +1311,7 @@ def legacy_resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
                     reply_markup=None
                 )
             except Exception:
-                bot.send_message(chat_id, text)
+                bot.send_message(chat_id, text, reply_markup=dice_pve_loss_reply_markup(final_session))
         else:
             bot.send_message(chat_id, text)
 
@@ -1338,12 +1375,12 @@ def legacy_resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
                 text,
                 chat_id,
                 int(final_session["session_message_id"]),
-                reply_markup=None
+                reply_markup=dice_pve_loss_reply_markup(final_session)
             )
         except Exception:
             bot.send_message(chat_id, text)
     else:
-        bot.send_message(chat_id, text)
+        bot.send_message(chat_id, text, reply_markup=dice_pve_loss_reply_markup(final_session))
 
     return final_session
 
@@ -2315,10 +2352,19 @@ def cmd_dicebot(m):
         return
 
     if get_open_dice_pve_session(m.from_user.id) is not None:
-        temp_reply(m, "У вас уже есть незавершённая партия с Кастеляном.")
+        temp_reply(m, "У вас уже есть незавершённая партия с Кастеляном. Используйте /dicebotreset, если она зависла.")
         return
 
     show_dice_pve_offer(m.chat.id, DICE_PVE_DEFAULT_STAKE)
+
+@bot.message_handler(commands=["dicebotreset"])
+def cmd_dicebotreset(m):
+    if not is_private_chat(m):
+        return
+    if cancel_open_dice_pve_session(m.from_user.id):
+        bot.reply_to(m, "Зависшая партия с Кастеляном сброшена.")
+    else:
+        bot.reply_to(m, "Активных партий не найдено.")
 
 @bot.message_handler(commands=["dice"])
 def cmd_dice(m):
