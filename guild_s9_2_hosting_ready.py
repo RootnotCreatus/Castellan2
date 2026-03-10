@@ -3533,8 +3533,8 @@ def cb_dice_pve_open(c):
         logging.exception("[DICE_PVE] failed to open series from lobby")
         bot.answer_callback_query(c.id, "Не удалось начать партию.", show_alert=True)
 
-@bot.callback_query_handler(func=lambda c: False)
-def legacy_cb_dice_pve(c):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dicepve:"))
+def cb_dice_pve(c):
     if needs_verification(c.from_user.id):
         bot.answer_callback_query(c.id, "Сначала пройдите верификацию.")
         return
