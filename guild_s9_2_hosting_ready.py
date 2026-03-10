@@ -1156,12 +1156,15 @@ def finish_dice_pve_cashout(session_id:int):
 
     return get_dice_pve_session(session_id)
 
-def dice_pve_win_text(session)->str:
+def dice_pve_win_text(session, is_tie:bool=False)->str:
     wins = int(session["player_stands"] or 0)
     payout = int(session["payout_lux"] or 0)
     fee = int(session["fee_lux"] or 0)
+    header = "🍀Удача улыбнулась вам. Вы можете забрать куш или рискнуть ради ещё большего выигрыша."
+    if is_tie:
+        header = "🍀Ничья сыграла в вашу пользу. Вы можете забрать половинный куш или рискнуть ради ещё большего выигрыша."
     return (
-        "Удача улыбнулась вам. Вы можете забрать выигрыш или рискнуть ради ещё большего выигрыша.\n\n"
+        f"{header}\n\n"
         f"Ваш бросок: <b>{int(session['player_roll_1'])}</b>\n"
         f"Бросок Кастеляна: <b>{int(session['bot_roll_1'])}</b>\n"
         f"Побед в серии: <b>{wins}</b>\n"
@@ -1174,6 +1177,19 @@ def dice_pve_loss_text(session)->str:
 
 def dice_pve_loss_reply_markup(session):
     return dice_pve_retry_keyboard(int(session["stake_lux"]))
+
+def disable_message_markup(chat_id:int, message_id:Optional[int]):
+    if not message_id:
+        return
+    try:
+        bot.edit_message_reply_markup(chat_id, int(message_id), reply_markup=None)
+    except Exception:
+        pass
+
+def send_new_pve_state_message(chat_id:int, session_id:int, text:str, reply_markup=None):
+    sent = bot.send_message(chat_id, text, reply_markup=reply_markup)
+    update_dice_pve_session_message(session_id, int(sent.message_id))
+    return int(sent.message_id)
 
 def dice_pve_cashout_text(user_id:int)->str:
     player = get_player(user_id)
@@ -1219,6 +1235,7 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
 
         player_roll = int(player_die.dice.value)
         bot_roll = int(bot_die.dice.value)
+        disable_message_markup(chat_id, session_message_id)
 
         if player_roll > bot_roll:
             payout = dice_pve_series_payout(stake, 1)
@@ -1231,43 +1248,40 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
                 payout,
                 fee
             )
+            send_new_pve_state_message(
+                chat_id,
+                int(session["id"]),
+                dice_pve_win_text(session),
+                reply_markup=dice_pve_action_keyboard(int(session["id"]))
+            )
+            return session
 
-            if session_message_id:
-                try:
-                    bot.edit_message_text(
-                        dice_pve_win_text(session),
-                        chat_id,
-                        int(session_message_id),
-                        reply_markup=dice_pve_action_keyboard(int(session["id"]))
-                    )
-                except Exception:
-                    sent = bot.send_message(
-                        chat_id,
-                        dice_pve_win_text(session),
-                        reply_markup=dice_pve_action_keyboard(int(session["id"]))
-                    )
-                    update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
-            else:
-                sent = bot.send_message(
-                    chat_id,
-                    dice_pve_win_text(session),
-                    reply_markup=dice_pve_action_keyboard(int(session["id"]))
-                )
-                update_dice_pve_session_message(int(session["id"]), int(sent.message_id))
-
+        if player_roll == bot_roll:
+            payout = max(stake, int(ceil(dice_pve_series_payout(stake, 1) / 2)))
+            fee = dice_pve_series_fee(stake, payout)
+            session = dice_pve_update_round(
+                int(session["id"]),
+                player_roll,
+                bot_roll,
+                1,
+                payout,
+                fee
+            )
+            send_new_pve_state_message(
+                chat_id,
+                int(session["id"]),
+                dice_pve_win_text(session, is_tie=True),
+                reply_markup=dice_pve_action_keyboard(int(session["id"]))
+            )
             return session
 
         session = finish_dice_pve_loss(int(session["id"]), player_roll, bot_roll)
-        loss_text = dice_pve_loss_text(session)
-
-        if session_message_id:
-            try:
-                bot.edit_message_text(loss_text, chat_id, int(session_message_id), reply_markup=dice_pve_loss_reply_markup(session))
-            except Exception:
-                bot.send_message(chat_id, loss_text, reply_markup=dice_pve_loss_reply_markup(session))
-        else:
-            bot.send_message(chat_id, loss_text)
-
+        send_new_pve_state_message(
+            chat_id,
+            int(session["id"]),
+            dice_pve_loss_text(session),
+            reply_markup=dice_pve_loss_reply_markup(session)
+        )
         return session
 
     except Exception:
@@ -1298,23 +1312,16 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
     if session["state"] != "active":
         return session
 
+    old_message_id = int(session["session_message_id"] or 0)
+
     if action == "cashout":
         final_session = finish_dice_pve_cashout(session_id)
-        text = dice_pve_cashout_text(int(final_session["user_id"]))
-
-        if final_session["session_message_id"]:
-            try:
-                bot.edit_message_text(
-                    text,
-                    chat_id,
-                    int(final_session["session_message_id"]),
-                    reply_markup=None
-                )
-            except Exception:
-                bot.send_message(chat_id, text)
-        else:
-            bot.send_message(chat_id, text)
-
+        disable_message_markup(chat_id, old_message_id)
+        send_new_pve_state_message(
+            chat_id,
+            session_id,
+            dice_pve_cashout_text(int(final_session["user_id"]))
+        )
         return final_session
 
     if action != "risk":
@@ -1326,12 +1333,14 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
 
     player_roll = int(player_die.dice.value)
     bot_roll = int(bot_die.dice.value)
+    disable_message_markup(chat_id, old_message_id)
+
+    wins = int(session["player_stands"] or 0) + 1
+    stake = int(session["stake_lux"])
 
     if player_roll > bot_roll:
-        wins = int(session["player_stands"] or 0) + 1
-        payout = dice_pve_series_payout(int(session["stake_lux"]), wins)
-        fee = dice_pve_series_fee(int(session["stake_lux"]), payout)
-
+        payout = dice_pve_series_payout(stake, wins)
+        fee = dice_pve_series_fee(stake, payout)
         active_session = dice_pve_update_round(
             session_id,
             player_roll,
@@ -1340,50 +1349,40 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
             payout,
             fee
         )
+        send_new_pve_state_message(
+            chat_id,
+            session_id,
+            dice_pve_win_text(active_session),
+            reply_markup=dice_pve_action_keyboard(session_id)
+        )
+        return active_session
 
-        text = dice_pve_win_text(active_session)
-
-        if active_session["session_message_id"]:
-            try:
-                bot.edit_message_text(
-                    text,
-                    chat_id,
-                    int(active_session["session_message_id"]),
-                    reply_markup=dice_pve_action_keyboard(session_id)
-                )
-            except Exception:
-                bot.send_message(
-                    chat_id,
-                    text,
-                    reply_markup=dice_pve_action_keyboard(session_id)
-                )
-        else:
-            sent = bot.send_message(
-                chat_id,
-                text,
-                reply_markup=dice_pve_action_keyboard(session_id)
-            )
-            update_dice_pve_session_message(session_id, int(sent.message_id))
-
+    if player_roll == bot_roll:
+        payout = max(stake, int(ceil(dice_pve_series_payout(stake, wins) / 2)))
+        fee = dice_pve_series_fee(stake, payout)
+        active_session = dice_pve_update_round(
+            session_id,
+            player_roll,
+            bot_roll,
+            wins,
+            payout,
+            fee
+        )
+        send_new_pve_state_message(
+            chat_id,
+            session_id,
+            dice_pve_win_text(active_session, is_tie=True),
+            reply_markup=dice_pve_action_keyboard(session_id)
+        )
         return active_session
 
     final_session = finish_dice_pve_loss(session_id, player_roll, bot_roll)
-    text = dice_pve_loss_text(final_session)
-    retry_kb = dice_pve_loss_reply_markup(final_session)
-
-    if final_session["session_message_id"]:
-        try:
-            bot.edit_message_text(
-                text,
-                chat_id,
-                int(final_session["session_message_id"]),
-                reply_markup=retry_kb
-            )
-        except Exception:
-            bot.send_message(chat_id, text, reply_markup=retry_kb)
-    else:
-        bot.send_message(chat_id, text, reply_markup=retry_kb)
-
+    send_new_pve_state_message(
+        chat_id,
+        session_id,
+        dice_pve_loss_text(final_session),
+        reply_markup=dice_pve_loss_reply_markup(final_session)
+    )
     return final_session
 
 def user_label_by_id(uid:int)->str:
