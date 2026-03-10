@@ -957,9 +957,9 @@ def create_dice_pve_session(uid:int, stake:int, session_message_id:Optional[int]
         "INSERT INTO dice_pve_sessions (user_id, stake_lux, state, created_at, updated_at, session_message_id) VALUES (?, ?, 'active', ?, ?, ?)",
         (uid, stake, ts, ts, session_message_id)
     )
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
-def update_dice_pve_session_message(session_id:int, message_id:int):
+def legacy_update_dice_pve_session_message(session_id:int, message_id:int):
     execute("UPDATE dice_pve_sessions SET session_message_id=?, updated_at=? WHERE id=?", (message_id, now_ts(), session_id))
 
 def styled_inline_button(text:str, callback_data:str, style:Optional[str]=None):
@@ -1023,7 +1023,7 @@ def dice_pve_update_round(session_id:int, player_roll:int, bot_roll:int, wins:in
             session_id
         )
     )
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
 def finish_dice_pve_loss(session_id:int, player_roll:int, bot_roll:int):
     ts = now_ts()
@@ -1043,7 +1043,7 @@ def finish_dice_pve_loss(session_id:int, player_roll:int, bot_roll:int):
             session_id
         )
     )
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
 def finish_dice_pve_cashout(session_id:int):
     with db_transaction() as conn:
@@ -1055,7 +1055,7 @@ def finish_dice_pve_cashout(session_id:int):
         if session is None:
             raise RuntimeError("Сессия не найдена.")
         if session["state"] != "active":
-            return get_dice_pve_session(session_id)
+            return legacy_get_dice_pve_session(session_id)
 
         payout = int(session["payout_lux"] or 0)
         ts = now_ts()
@@ -1107,7 +1107,7 @@ def finish_dice_pve_cashout(session_id:int):
                 )
             )
 
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
 def dice_pve_win_text(session)->str:
     wins = int(session["player_stands"] or 0)
@@ -1241,8 +1241,8 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
 
         raise
 
-def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
-    session = get_dice_pve_session(session_id)
+def legacy_resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
+    session = legacy_get_dice_pve_session(session_id)
     if session is None:
         raise RuntimeError("Сессия не найдена.")
     if session["state"] != "active":
@@ -1638,29 +1638,29 @@ def list_expired_open_dice_duels():
     threshold=now_ts()-DICE_WAIT_SECONDS
     return fetchall("SELECT * FROM dice_duels WHERE status=? AND created_at<?", (DICE_STATUS_OPEN, threshold))
 
-def dice_pve_daily_count(uid:int)->int:
+def legacy_dice_pve_daily_count(uid:int)->int:
     start_of_day = int(datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     row = fetchone("SELECT COUNT(*) c FROM dice_pve_sessions WHERE user_id=? AND created_at>=?", (uid, start_of_day))
     return int(row['c']) if row else 0
 
-def get_open_dice_pve_session(uid:int):
+def legacy_get_open_dice_pve_session(uid:int):
     return fetchone("SELECT * FROM dice_pve_sessions WHERE user_id=? AND state='await_choice' ORDER BY id DESC LIMIT 1", (uid,))
 
-def get_dice_pve_session(session_id:int):
+def legacy_get_dice_pve_session(session_id:int):
     return fetchone("SELECT * FROM dice_pve_sessions WHERE id=?", (session_id,))
 
-def create_dice_pve_session(uid:int, stake:int, player_roll_1:int, bot_roll_1:int, session_message_id:Optional[int]=None):
+def legacy_create_dice_pve_session(uid:int, stake:int, player_roll_1:int, bot_roll_1:int, session_message_id:Optional[int]=None):
     ts = now_ts()
     session_id = execute(
         "INSERT INTO dice_pve_sessions (user_id, stake_lux, state, created_at, updated_at, player_roll_1, player_total, bot_roll_1, bot_total, session_message_id) VALUES (?, ?, 'await_choice', ?, ?, ?, ?, ?, ?, ?)",
         (uid, stake, ts, ts, int(player_roll_1), int(player_roll_1), int(bot_roll_1), int(bot_roll_1), session_message_id)
     )
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
 def update_dice_pve_session_message(session_id:int, message_id:int):
     execute("UPDATE dice_pve_sessions SET session_message_id=?, updated_at=? WHERE id=?", (message_id, now_ts(), session_id))
 
-def dice_pve_keyboard(session_id:int):
+def legacy_dice_pve_keyboard(session_id:int):
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("Остановиться", callback_data=f"dicepve:stand:{session_id}"),
@@ -1668,12 +1668,12 @@ def dice_pve_keyboard(session_id:int):
     )
     return kb
 
-def dice_pve_status_line(total:int)->str:
+def legacy_dice_pve_status_line(total:int)->str:
     if total > DICE_PVE_TARGET:
         return f"перебор: {total}/{DICE_PVE_TARGET}"
     return f"{total}/{DICE_PVE_TARGET}"
 
-def dice_pve_intro_text(session)->str:
+def legacy_legacy_dice_pve_intro_text(session)->str:
     return (
         f"<b>Кости смотрителя #{session['id']}</b>\n"
         f"Ставка: <b>{session['stake_lux']}❂</b>\n\n"
@@ -1686,7 +1686,7 @@ def dice_pve_intro_text(session)->str:
         f"Можно остановиться сейчас или рискнуть и перебросить только свой кубик."
     )
 
-def dice_pve_choose_bot_action(bot_total:int, player_total:int)->bool:
+def legacy_dice_pve_choose_bot_action(bot_total:int, player_total:int)->bool:
     if bot_total >= DICE_PVE_TARGET:
         return False
     if bot_total <= 6:
@@ -1697,7 +1697,7 @@ def dice_pve_choose_bot_action(bot_total:int, player_total:int)->bool:
         return True
     return False
 
-def dice_pve_calculate_payout(stake:int, result:str):
+def legacy_dice_pve_calculate_payout(stake:int, result:str):
     if result == 'win':
         payout = max(stake + 1, int((stake * DICE_PVE_WIN_MULTIPLIER + 99) // 100))
         fee = max(0, stake * 2 - payout)
@@ -1708,8 +1708,8 @@ def dice_pve_calculate_payout(stake:int, result:str):
         return payout, fee
     return 0, stake
 
-def finish_dice_pve_session(session_id:int, player_roll_2:Optional[int], bot_roll_2:Optional[int], player_total:int, bot_total:int, player_stands:bool, bot_stands:bool):
-    session = get_dice_pve_session(session_id)
+def legacy_finish_dice_pve_session(session_id:int, player_roll_2:Optional[int], bot_roll_2:Optional[int], player_total:int, bot_total:int, player_stands:bool, bot_stands:bool):
+    session = legacy_get_dice_pve_session(session_id)
     if session is None:
         raise RuntimeError('Сессия не найдена')
     if session['state'] != 'await_choice':
@@ -1730,7 +1730,7 @@ def finish_dice_pve_session(session_id:int, player_roll_2:Optional[int], bot_rol
         else:
             result = 'tie'
     stake = int(session['stake_lux'])
-    payout, fee = dice_pve_calculate_payout(stake, result)
+    payout, fee = legacy_dice_pve_calculate_payout(stake, result)
     with db_transaction() as conn:
         cur = conn.cursor()
         live = cur.execute("SELECT * FROM dice_pve_sessions WHERE id=?", (session_id,)).fetchone()
@@ -1754,9 +1754,9 @@ def finish_dice_pve_session(session_id:int, player_roll_2:Optional[int], bot_rol
                 meta = f'session_id={session_id};stake={stake};result={result};fee={fee}'
                 cur.execute("INSERT INTO lux_log (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)", (int(live['user_id']), int(payout), reason, ts))
                 cur.execute("INSERT INTO economy_ledger (actor_user_id,target_user_id,resource,delta,reason,meta,created_at) VALUES (?,?,?,?,?,?,?)", (int(live['user_id']), int(live['user_id']), 'lux', int(payout), reason, meta, ts))
-    return get_dice_pve_session(session_id)
+    return legacy_get_dice_pve_session(session_id)
 
-def dice_pve_result_text(session)->str:
+def legacy_dice_pve_result_text(session)->str:
     result = str(session['result'])
     result_line = {
         'win': 'Вы победили Цитадель.',
@@ -1779,12 +1779,12 @@ def dice_pve_result_text(session)->str:
     ]
     return "\n".join(lines)
 
-def play_dice_pve_round(m, stake:int):
+def legacy_play_dice_pve_round(m, stake:int):
     uid = m.from_user.id
-    if get_open_dice_pve_session(uid) is not None:
+    if legacy_get_open_dice_pve_session(uid) is not None:
         temp_reply(m, 'У вас уже есть незавершённая партия с Цитаделью в личке.')
         return
-    if (not is_admin(uid)) and dice_pve_daily_count(uid) >= DICE_PVE_DAILY_LIMIT:
+    if (not is_admin(uid)) and legacy_dice_pve_daily_count(uid) >= DICE_PVE_DAILY_LIMIT:
         temp_reply(m, f'На сегодня лимит партий исчерпан: {DICE_PVE_DAILY_LIMIT}.')
         return
     player = get_player(uid)
@@ -1796,9 +1796,9 @@ def play_dice_pve_round(m, stake:int):
         first = bot.send_dice(uid, emoji='🎲')
         second = bot.send_dice(uid, emoji='🎲')
         time.sleep(4.2)
-        session = create_dice_pve_session(uid, stake, int(first.dice.value), int(second.dice.value))
-        sent = bot.send_message(uid, dice_pve_intro_text(session), reply_markup=dice_pve_keyboard(int(session['id'])))
-        update_dice_pve_session_message(int(session['id']), int(sent.message_id))
+        session = legacy_create_dice_pve_session(uid, stake, int(first.dice.value), int(second.dice.value))
+        sent = bot.send_message(uid, legacy_dice_pve_intro_text(session), reply_markup=legacy_dice_pve_keyboard(int(session['id'])))
+        legacy_update_dice_pve_session_message(int(session['id']), int(sent.message_id))
     except Exception:
         logging.exception('[DICE_PVE] failed to start session')
         try:
@@ -1808,7 +1808,7 @@ def play_dice_pve_round(m, stake:int):
         temp_reply(m, 'Не удалось начать партию с Цитаделью.')
 
 def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
-    session = get_dice_pve_session(session_id)
+    session = legacy_get_dice_pve_session(session_id)
     if session is None:
         raise RuntimeError('Сессия не найдена.')
     if session['state'] != 'await_choice':
@@ -1822,7 +1822,7 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
     pending_animation = []
     if action == 'risk':
         pending_animation.append(('player', bot.send_dice(chat_id, emoji='🎲')))
-    if dice_pve_choose_bot_action(bot_total, player_total if action != 'risk' else min(player_total + 6, DICE_PVE_TARGET + 6)):
+    if legacy_dice_pve_choose_bot_action(bot_total, player_total if action != 'risk' else min(player_total + 6, DICE_PVE_TARGET + 6)):
         pending_animation.append(('bot', bot.send_dice(chat_id, emoji='🎲')))
         bot_stands = False
     if pending_animation:
@@ -1835,8 +1835,8 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
             bot_roll_2 = int(msg.dice.value)
             bot_total += bot_roll_2
 
-    final_session = finish_dice_pve_session(session_id, player_roll_2, bot_roll_2, player_total, bot_total, True, bot_stands)
-    result_text = dice_pve_result_text(final_session)
+    final_session = legacy_finish_dice_pve_session(session_id, player_roll_2, bot_roll_2, player_total, bot_total, True, bot_stands)
+    result_text = legacy_dice_pve_result_text(final_session)
     try:
         if final_session['session_message_id']:
             bot.edit_message_text(result_text, chat_id, int(final_session['session_message_id']), reply_markup=None)
@@ -3550,7 +3550,7 @@ def cb_dice_pve(c):
 
     action = parts[1]
     session_id = int(parts[2])
-    session = get_dice_pve_session(session_id)
+    session = legacy_get_dice_pve_session(session_id)
 
     if session is None:
         bot.answer_callback_query(c.id, "Партия не найдена.")
