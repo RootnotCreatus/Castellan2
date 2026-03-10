@@ -87,8 +87,9 @@ DICE_WAIT_SECONDS=300
 DICE_FEE_PERCENT=4
 DICE_PVE_DAILY_LIMIT=20
 DICE_PVE_DEFAULT_STAKE=DICE_MIN_STAKE
-DICE_PVE_SERIES_BASE=1.5
-DICE_PVE_SERIES_STEP=0.5
+DICE_PVE_SERIES_BASE=1.75
+DICE_PVE_SERIES_STEP=0.75
+DICE_PVE_TIE_STEP_FACTOR=0.75
 SCHEMA_VERSION=3
 CONV_TTL_SECONDS=1800
 
@@ -1029,26 +1030,47 @@ def dice_pve_offer_keyboard(stake:int):
     return kb
 
 def dice_pve_series_multiplier(wins:int)->float:
-    return DICE_PVE_SERIES_BASE + max(0, wins - 1) * DICE_PVE_SERIES_STEP
+    if wins <= 0:
+        return 1.0
+    if wins == 1:
+        return 1.75
+    if wins == 2:
+        return 2.25
+    if wins == 3:
+        return 3.0
+    return 3.0 + (wins - 3) * DICE_PVE_SERIES_STEP
 
 def dice_pve_series_payout(stake:int, wins:int)->int:
     return max(stake, int(ceil(stake * dice_pve_series_multiplier(wins))))
 
-def dice_pve_series_fee(stake:int, payout:int)->int:
-    return max(0, int(round(payout * 0.06)))
+def dice_pve_tie_payout(stake:int, wins:int)->int:
+    prev_multiplier = dice_pve_series_multiplier(wins - 1) if wins > 1 else 1.0
+    current_multiplier = dice_pve_series_multiplier(wins)
+    tie_multiplier = prev_multiplier + (current_multiplier - prev_multiplier) * DICE_PVE_TIE_STEP_FACTOR
+    return max(stake, int(ceil(stake * tie_multiplier)))
 
-def dice_pve_action_keyboard(session_id:int):
+def dice_pve_series_fee(stake:int, payout:int)->int:
+    profit = max(0, int(payout) - int(stake))
+    return max(0, int(ceil(profit * (DICE_FEE_PERCENT / 100.0))))
+
+def dice_pve_action_keyboard(session_id:int, stake:int):
     kb = types.InlineKeyboardMarkup()
     kb.row(
         styled_inline_button("Остановиться", f"dicepve:cashout:{session_id}", style="primary"),
         styled_inline_button("Рискнуть", f"dicepve:risk:{session_id}", style="danger")
+    )
+    kb.row(
+        styled_inline_button(f"Изменить ставку ({stake}❂)", f"dicepveopen:stake:{stake}", style="primary")
     )
     return kb
 
 def dice_pve_retry_keyboard(stake:int):
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        styled_inline_button("Попробовать ещё раз", f"dicepveopen:throw:{stake}", style="primary")
+        styled_inline_button("Попробовать ещё раз", f"dicepveopen:throw:{stake}", style="success")
+    )
+    kb.row(
+        styled_inline_button(f"Изменить ставку ({stake}❂)", f"dicepveopen:stake:{stake}", style="primary")
     )
     return kb
 
@@ -1105,6 +1127,8 @@ def finish_dice_pve_cashout(session_id:int):
             return get_dice_pve_session(session_id)
 
         payout = int(session["payout_lux"] or 0)
+        fee = int(session["fee_lux"] or 0)
+        net_payout = max(0, payout - fee)
         ts = now_ts()
 
         cur.execute(
@@ -1114,7 +1138,7 @@ def finish_dice_pve_cashout(session_id:int):
             (ts, ts, session_id)
         )
 
-        if payout > 0:
+        if net_payout > 0:
             player = cur.execute(
                 "SELECT * FROM players WHERE user_id=?",
                 (int(session["user_id"]),)
@@ -1122,7 +1146,7 @@ def finish_dice_pve_cashout(session_id:int):
             if player is None:
                 raise RuntimeError("Игрок не найден.")
 
-            new_lux = int(player["lux"]) + payout
+            new_lux = int(player["lux"]) + net_payout
             cur.execute(
                 "UPDATE players SET lux=?, updated_at=? WHERE user_id=?",
                 (new_lux, ts, int(session["user_id"]))
@@ -1131,13 +1155,14 @@ def finish_dice_pve_cashout(session_id:int):
             meta = (
                 f"session_id={session_id};"
                 f"stake={int(session['stake_lux'])};"
-                f"wins={int(session['player_stands'] or 0)}"
+                f"wins={int(session['player_stands'] or 0)};"
+                f"gross={payout};fee={fee};net={net_payout}"
             )
 
             cur.execute(
                 "INSERT INTO lux_log (user_id, delta, reason, created_at) "
                 "VALUES (?, ?, ?, ?)",
-                (int(session["user_id"]), payout, "dice_pve_cashout", ts)
+                (int(session["user_id"]), net_payout, "dice_pve_cashout", ts)
             )
             cur.execute(
                 "INSERT INTO economy_ledger "
@@ -1147,7 +1172,7 @@ def finish_dice_pve_cashout(session_id:int):
                     int(session["user_id"]),
                     int(session["user_id"]),
                     "lux",
-                    payout,
+                    net_payout,
                     "dice_pve_cashout",
                     meta,
                     ts
@@ -1160,16 +1185,18 @@ def dice_pve_win_text(session, is_tie:bool=False)->str:
     wins = int(session["player_stands"] or 0)
     payout = int(session["payout_lux"] or 0)
     fee = int(session["fee_lux"] or 0)
+    net = max(0, payout - fee)
     header = "🍀Удача улыбнулась вам. Вы можете забрать куш или рискнуть ради ещё большего выигрыша."
     if is_tie:
-        header = "🍀Ничья сыграла в вашу пользу. Вы можете забрать половинный куш или рискнуть ради ещё большего выигрыша."
+        header = "🍀Ничья сыграла в вашу пользу. Вы можете забрать куш или рискнуть ради ещё большего выигрыша."
     return (
         f"{header}\n\n"
         f"Ваш бросок: <b>{int(session['player_roll_1'])}</b>\n"
         f"Бросок Кастеляна: <b>{int(session['bot_roll_1'])}</b>\n"
         f"Побед в серии: <b>{wins}</b>\n"
-        f"Текущий выигрыш: <b>{payout}❂</b>\n\n"
-        f"Пошлина Цитадели: <b>{fee}❂</b>"
+        f"Куш: <b>{payout}❂</b>\n"
+        f"Пошлина Цитадели: <b>{fee}❂</b>\n"
+        f"К выдаче сейчас: <b>{net}❂</b>"
     )
 
 def dice_pve_loss_text(session)->str:
@@ -1252,12 +1279,12 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
                 chat_id,
                 int(session["id"]),
                 dice_pve_win_text(session),
-                reply_markup=dice_pve_action_keyboard(int(session["id"]))
+                reply_markup=dice_pve_action_keyboard(int(session["id"]), int(session["stake_lux"]))
             )
             return session
 
         if player_roll == bot_roll:
-            payout = max(stake, int(ceil(dice_pve_series_payout(stake, 1) / 2)))
+            payout = dice_pve_tie_payout(stake, 1)
             fee = dice_pve_series_fee(stake, payout)
             session = dice_pve_update_round(
                 int(session["id"]),
@@ -1271,7 +1298,7 @@ def start_dice_pve_series(chat_id:int, user_id:int, stake:int, session_message_i
                 chat_id,
                 int(session["id"]),
                 dice_pve_win_text(session, is_tie=True),
-                reply_markup=dice_pve_action_keyboard(int(session["id"]))
+                reply_markup=dice_pve_action_keyboard(int(session["id"]), int(session["stake_lux"]))
             )
             return session
 
@@ -1353,12 +1380,12 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
             chat_id,
             session_id,
             dice_pve_win_text(active_session),
-            reply_markup=dice_pve_action_keyboard(session_id)
+            reply_markup=dice_pve_action_keyboard(session_id, stake)
         )
         return active_session
 
     if player_roll == bot_roll:
-        payout = max(stake, int(ceil(dice_pve_series_payout(stake, wins) / 2)))
+        payout = dice_pve_tie_payout(stake, wins)
         fee = dice_pve_series_fee(stake, payout)
         active_session = dice_pve_update_round(
             session_id,
@@ -1372,7 +1399,7 @@ def resolve_dice_pve_choice(session_id:int, action:str, chat_id:int):
             chat_id,
             session_id,
             dice_pve_win_text(active_session, is_tie=True),
-            reply_markup=dice_pve_action_keyboard(session_id)
+            reply_markup=dice_pve_action_keyboard(session_id, stake)
         )
         return active_session
 
@@ -3350,6 +3377,8 @@ def cb_dice_pve_open(c):
         return
 
     if action == "stake":
+        cancel_open_dice_pve_session(c.from_user.id)
+        disable_message_markup(c.message.chat.id, c.message.message_id)
         conversation_set(
             c.from_user.id,
             "dice_pve_setup",
