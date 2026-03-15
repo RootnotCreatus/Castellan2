@@ -1866,7 +1866,7 @@ def review_keyboard(submission_id:int):
 
 def render_leaders():
     raw_rows = get_leaders(50)
-    rows = [row for row in raw_rows if not is_master(int(row["user_id"]))][:10]
+    rows = [row for row in raw_rows if int(row["user_id"]) != ADMIN_ID][:10]
     lines = ["<b>Доска почётных творцов:</b>", ""]
     if not rows:
         lines.append("Пока нет данных.")
