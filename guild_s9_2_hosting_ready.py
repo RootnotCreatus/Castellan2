@@ -355,15 +355,8 @@ def start_keyboard():
 
 def render_start_text()->str:
     return (
-        "<b>Цитадель Творцов</b> — это игра роста внутри гильдии.\n\n"
-        "Здесь вы представляете себя, публикуете работы, берёте задания, получаете опыт, превращаете его в люксы, покупаете предметы в лавке и растёте по рангам.\n\n"
-        "<b>Правила</b>\n"
-        "1. Уважайте чужой труд и чужое время.\n"
-        "2. Публикуйте работы по теме и в нужных топиках.\n"
-        "3. Критика здесь нужна для роста, а не для унижения.\n"
-        "4. Накрутка активности и попытки обмануть систему будут наказываться.\n"
-        "5. Главная ценность — не шум, а созидание.\n\n"
-        "Список доступных команд — по кнопке ниже или через /command."
+        "Цитадель Творцов — не просто чат для объединения творческих людей, а целая социальная геймифицированная система взаимодействия, которая побудит вас творить и процветать.\n\n"
+        "Здесь мы ценим ваш талант и способность творить. Чем больше вы творите, тем выше продвигаетесь по социальной лестнице Цитадели."
     )
 
 
@@ -842,7 +835,7 @@ def update_player_lux(uid:int, delta:int, reason:str, actor_user_id:Optional[int
     log_economy(actor_user_id, uid, "lux", delta, reason, meta)
     return get_player(uid)
 
-def convert_xp_to_lux(uid:int, xp_amount:int):
+def legacy_convert_xp_to_lux(uid:int, xp_amount:int):
     player=get_player(uid)
     if player is None: raise RuntimeError("Player not found")
     if xp_amount<=0 or xp_amount%XP_TO_LUX_RATE!=0: raise RuntimeError(f"Отправьте положительное число, кратное {XP_TO_LUX_RATE}")
@@ -1604,7 +1597,7 @@ def update_player_lux(uid:int, delta:int, reason:str, actor_user_id:Optional[int
     log_economy(actor_user_id, uid, "lux", delta, reason, meta)
     return get_player(uid)
 
-def convert_xp_to_lux(uid:int, xp_amount:int):
+def legacy_convert_xp_to_lux(uid:int, xp_amount:int):
     player=get_player(uid)
     if player is None: raise RuntimeError("Player not found")
     if xp_amount<=0 or xp_amount%XP_TO_LUX_RATE!=0: raise RuntimeError(f"Отправьте положительное число, кратное {XP_TO_LUX_RATE}")
@@ -1726,9 +1719,62 @@ def user_label_by_id(uid:int)->str:
 
 # views
 
+TITLE_PRIVILEGES = {
+    "Ученик": [
+        "Доступ к заданиям, лавке, игре в кости",
+    ],
+    "Подмастерье": [
+        "Возможность подать свою работу в Галерею",
+        "Скидка на предметы в лавке — 5%",
+    ],
+    "Ремесленник": [
+        "Скидка на предметы в лавке — 10%",
+        "Выплата в размере 40❂ в месяц",
+    ],
+    "Мастеровой": [
+        "Возможность стать Мастером Цитадели",
+        "Скидка на предметы в лавке — 15%",
+        "Выплата в размере 60❂ в месяц",
+    ],
+    "Искусник": [
+        "Возможность напрямую выставлять свои работы в Галерее",
+        "Скидка на предметы в лавке — 20%",
+        "Выплата в размере 100❂ в месяц",
+    ],
+    "Старший ремесленник": [
+        "Возможность влиять на развитие Цитадели",
+        "Скидка на предметы в лавке — 40%",
+        "Выплата в размере 200❂ в месяц",
+    ],
+}
+
+NO_PRIVILEGES_TITLES = {"Цеховой", "Наставник", "Зодчий", "Архитектор"}
+
+def render_title_privileges(player)->str:
+    level = int(player["level"] or 0)
+    title = str(player["title"] or "")
+    if level < 10 or title == "без звания":
+        return "<b>Привилегии</b>\nПривилегии отсутствуют."
+    if title in NO_PRIVILEGES_TITLES:
+        return ""
+    lines = TITLE_PRIVILEGES.get(title)
+    if not lines:
+        return "<b>Привилегии</b>\nПривилегии отсутствуют."
+    return "<b>Привилегии</b>\n" + "\n".join(f"• {html.escape(line)}" for line in lines)
+
 def render_profile_text(player):
-    st=build_level_state(int(player["xp"])); about=player["about_text"] or "—"
-    return f"<b>{player['title']}, {player['level']} уровень</b> (<code>{player['xp']}/{st.next_level_xp_target}✶</code>)\n\nБаланс люксов: <b>{player['lux']}❂</b>\n\nО вас: {about}"
+    st = build_level_state(int(player["xp"]))
+    about = html.escape(player["about_text"] or "—")
+    base = (
+        f"<b>{html.escape(str(player['title']))}, {player['level']} уровень</b> "
+        f"(<code>{player['xp']}/{st.next_level_xp_target}✶</code>)\n\n"
+        f"Баланс люксов: <b>{player['lux']}❂</b>\n\n"
+        f"О вас: {about}"
+    )
+    privileges = render_title_privileges(player)
+    if privileges:
+        base += "\n\n" + privileges
+    return base
 
 def profile_keyboard():
     kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("Изменить информацию о себе", callback_data="profile:edit_about")); kb.add(types.InlineKeyboardButton("Инвентарь", callback_data="profile:inventory")); return kb
@@ -2065,11 +2111,10 @@ def expire_dice_duels_loop():
 
 COMMANDS_REGISTRY = [
     {"name": "/start", "desc": "описание игры", "roles": ("newbie", "player", "master", "admin")},
-    {"name": "/command", "desc": "список доступных команд", "roles": ("newbie", "player", "master", "admin")},
+    {"name": "/commands", "desc": "список доступных команд", "roles": ("newbie", "player", "master", "admin")},
     {"name": "/profile", "desc": "профиль", "roles": ("player", "master", "admin")},
     {"name": "/tasks", "desc": "раздел задач", "roles": ("player", "master", "admin")},
-    {"name": "/convert", "desc": "конвертация XP в люксы", "roles": ("player", "master", "admin")},
-    {"name": "/transfer", "desc": "перевод люксов", "roles": ("player", "master", "admin")},
+        {"name": "/transfer", "desc": "перевод люксов", "roles": ("player", "master", "admin")},
     {"name": "/taberna", "desc": "лавка", "roles": ("player", "master", "admin")},
     {"name": "/dice", "desc": "дуэль в кости в топике игр", "roles": ("player", "master", "admin")},
     {"name": "/leaders", "desc": "таблица лидеров", "roles": ("master", "admin")},
@@ -2325,8 +2370,8 @@ def cmd_start(m):
         return
     bot.reply_to(m, render_start_text(), reply_markup=start_keyboard())
 
-@bot.message_handler(commands=["command"])
-def cmd_command(m):
+@bot.message_handler(commands=["commands"])
+def cmd_commands(m):
     if not require_verified_message(m): return
     bot.reply_to(m, render_commands_for_user(m.from_user.id))
 
@@ -2447,12 +2492,11 @@ def cmd_leaders(m):
         logging.exception("[LEADERS] failed to create leaders snapshot by command")
         bot.reply_to(m, "Не удалось обновить таблицу лидеров.")
 
-@bot.message_handler(commands=["convert"])
-def cmd_convert(m):
+def legacy_cmd_convert(m):
     if not require_verified_message(m): return
     p=get_player(m.from_user.id)
     if p is None: bot.reply_to(m, "Профиль не найден. Сначала расскажите о себе в теме знакомства."); return
-    conversation_set(m.from_user.id, 'convert', 'amount', {}, 'convert'); send_prompt("convert", m.from_user.id, f"Введите количеством XP, которое хотите конвертировать в люксы. Курс: {XP_TO_LUX_RATE}✶ = 1❂")
+    bot.reply_to(m, 'Механика конвертации опыта в люксы удалена.')
 
 @bot.message_handler(commands=["transfer"])
 def cmd_transfer(m):
@@ -2676,8 +2720,7 @@ def cmd_endevent(m):
         return
     bot.reply_to(m, f'Событие завершено. Награждены: {", ".join(user_label_by_id(uid) for uid in valid) if valid else "никто"}.')
 
-@bot.message_handler(commands=["start"])
-def cmd_start(m):
+def legacy_cmd_start_private(m):
     if is_private_chat(m):
         if needs_verification(m.from_user.id):
             bot.reply_to(m, 'Сначала пройдите верификацию у врат Цитадели: поставьте реакцию 💯 на приветственное сообщение в топике врат.')
@@ -2884,19 +2927,10 @@ def handle_conversation_flow_message(m, conv):
     txt = get_message_text(m).strip()
 
     if flow == 'convert':
-        if step == 'amount':
-            if not txt.isdigit():
-                bot.reply_to(m, f"Нужно отправить положительное число, кратное {XP_TO_LUX_RATE}.")
-                return True
-            try:
-                xp_p,lux_p,lux_amt=convert_xp_to_lux(m.from_user.id,int(txt))
-            except RuntimeError as exc:
-                bot.reply_to(m, str(exc))
-                return True
-            clear_conversation_with_prompt(m.from_user.id)
-            safe_delete(m.chat.id,m.message_id)
-            bot.send_message(m.chat.id, f"Конвертация выполнена: {txt}✶ → {lux_amt}❂\nНовый баланс: {lux_p['lux']}❂\nОставшийся опыт: {xp_p['xp']}✶")
-            return True
+        clear_conversation_with_prompt(m.from_user.id)
+        bot.reply_to(m, 'Механика конвертации опыта в люксы удалена.')
+        return True
+
 
     if flow == 'task_submit':
         claim_id = int(data.get('claim_id', 0) or 0)
@@ -3029,12 +3063,8 @@ def handle_messages(m):
             if p is None: pending_about_edit.discard(m.from_user.id); clear_prompt("about",m.from_user.id); bot.reply_to(m, "Профиль не найден. Сначала расскажите о себе в теме знакомства."); return
             up=update_player_about_only(m.from_user.id,txt); pending_about_edit.discard(m.from_user.id); clear_prompt("about",m.from_user.id); safe_delete(m.chat.id,m.message_id); bot.send_message(m.chat.id, "Описание обновлено."); bot.send_message(m.chat.id, render_profile_text(up), reply_markup=profile_keyboard()); return
         if m.from_user.id in pending_convert_xp:
-            raw=get_message_text(m)
-            if not raw.isdigit(): bot.reply_to(m, f"Нужно отправить положительное число, кратное {XP_TO_LUX_RATE}."); return
-            try: xp_p,lux_p,lux_amt=convert_xp_to_lux(m.from_user.id,int(raw))
-            except RuntimeError as exc: bot.reply_to(m, str(exc)); return
             pending_convert_xp.discard(m.from_user.id); clear_prompt("convert",m.from_user.id); safe_delete(m.chat.id,m.message_id)
-            bot.send_message(m.chat.id, f"Конвертация выполнена: {raw}✶ → {lux_amt}❂\nНовый баланс: {lux_p['lux']}❂\nОставшийся опыт: {xp_p['xp']}✶"); return
+            bot.send_message(m.chat.id, 'Механика конвертации опыта в люксы удалена.'); return
         if m.from_user.id in pending_task_submit:
             claim_id=pending_task_submit[m.from_user.id]; claim=get_task_claim(claim_id)
             if claim is None or claim['status']!=TASK_STATUS_ACTIVE: pending_task_submit.pop(m.from_user.id,None); clear_prompt("task_submit",m.from_user.id); bot.reply_to(m, "Эта заявка на задание уже недоступна."); return
@@ -3808,7 +3838,7 @@ def convert_seals_to_lux(uid:int, seals_tenths:int):
         cur.execute("INSERT INTO economy_ledger (actor_user_id,target_user_id,resource,delta,reason,meta,created_at) VALUES (?,?,?,?,?,?,?)", (uid, uid, 'lux', net, 'seal_convert', f'fee={fee}', ts))
     return get_player(uid), gross, fee, net
 
-def convert_xp_to_lux(uid:int, xp_amount:int):
+def legacy_convert_xp_to_lux(uid:int, xp_amount:int):
     player=get_player(uid)
     if player is None:
         raise RuntimeError('Player not found')
